@@ -6,7 +6,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <terark/num_to_str.hpp>
-#include <nfsc/libnfs.h>
+#include <nfsc/libnfs.h> // yum install libnfs-devel
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
