@@ -20,6 +20,44 @@ const char* git_version_hash_info_toplingdb_fs();
 
 namespace ROCKSDB_NAMESPACE {
 
+// lignfs https://github.com/sahlberg/libnfs
+// libnfs changed param order of read/pread/pwrite at commit 5e8f7ce2,
+// we workaround both by SFINAE:
+
+template<class Bufptr>
+auto fix_nfs_read(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len)
+-> decltype(nfs_read(nfs, fh, buf, len))
+   { return nfs_read(nfs, fh, buf, len); }
+
+template<class Bufptr>
+auto fix_nfs_read(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len)
+-> decltype(nfs_read(nfs, fh, len, buf))
+   { return nfs_read(nfs, fh, len, buf); }
+
+template<class Bufptr>
+auto fix_nfs_pread(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len, off_t offset)
+-> decltype(nfs_pread(nfs, fh, buf, len, offset))
+   { return nfs_pread(nfs, fh, buf, len, offset); }
+
+template<class Bufptr>
+auto fix_nfs_pread(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len, off_t offset)
+-> decltype(nfs_pread(nfs, fh, offset, len, buf))
+   { return nfs_pread(nfs, fh, offset, len, buf); }
+
+template<class Bufptr>
+auto fix_nfs_pwrite(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len, off_t offset)
+-> decltype(nfs_pwrite(nfs, fh, buf, len, offset))
+   { return nfs_pwrite(nfs, fh, buf, len, offset); }
+
+template<class Bufptr>
+auto fix_nfs_pwrite(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len, off_t offset)
+-> decltype(nfs_pwrite(nfs, fh, offset, len, buf))
+   { return nfs_pwrite(nfs, fh, offset, len, buf); }
+
+#define nfs_read   fix_nfs_read
+#define nfs_pread  fix_nfs_pread
+#define nfs_pwrite fix_nfs_pwrite
+
 class S3FS : public FileSystem {
  public:
   S3FS(const json&, const SidePluginRepo&);
@@ -343,7 +381,7 @@ struct TailingNFSWritableFile : FSWritableFile {
   }
   IOStatus Append(const Slice& data, const IOOptions& options,
                   IODebugContext* dbg) override {
-    int len = nfs_write(m_nfs, m_fh, data.data_, data.size_);
+    int len = nfs_pwrite(m_nfs, m_fh, data.data_, data.size_, m_offset);
     if (len < 0) {
       return IOStatus::IOError("TailingNFSWritableFile::Append nfs_write",
           m_fname + " : " + nfs_get_error(m_nfs));
@@ -354,7 +392,7 @@ struct TailingNFSWritableFile : FSWritableFile {
   IOStatus Append(const Slice& data, const IOOptions& options,
                   const DataVerificationInfo& verification_info,
                   IODebugContext* dbg) override {
-    int len = nfs_write(m_nfs, m_fh, data.data_, data.size_);
+    int len = nfs_pwrite(m_nfs, m_fh, data.data_, data.size_, m_offset);
     if (len < 0) {
       return IOStatus::IOError("TailingNFSWritableFile::Append nfs_write",
           m_fname + " : " + nfs_get_error(m_nfs));

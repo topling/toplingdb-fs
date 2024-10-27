@@ -28,6 +28,56 @@ namespace ROCKSDB_NAMESPACE {
 // even with `noac`, linux kernel nfs has an extra getattr before
 // tailing read, this is not needed. libnfs will not send getattr
 // before (tailing) read.
+
+// lignfs https://github.com/sahlberg/libnfs
+// libnfs changed param order of read/pread/pwrite at commit 5e8f7ce2,
+// we workaround both by SFINAE:
+
+template<class Bufptr>
+auto fix_nfs_read(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len)
+-> decltype(nfs_read(nfs, fh, buf, len))
+   { return nfs_read(nfs, fh, buf, len); }
+
+template<class Bufptr>
+auto fix_nfs_read(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len)
+-> decltype(nfs_read(nfs, fh, len, buf))
+   { return nfs_read(nfs, fh, len, buf); }
+
+template<class Bufptr>
+auto fix_nfs_pread(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len, off_t offset)
+-> decltype(nfs_pread(nfs, fh, buf, len, offset))
+   { return nfs_pread(nfs, fh, buf, len, offset); }
+
+template<class Bufptr>
+auto fix_nfs_pread(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len, off_t offset)
+-> decltype(nfs_pread(nfs, fh, offset, len, buf))
+   { return nfs_pread(nfs, fh, offset, len, buf); }
+
+template<class Bufptr>
+auto fix_nfs_pwrite(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len, off_t offset)
+-> decltype(nfs_pwrite(nfs, fh, buf, len, offset))
+   { return nfs_pwrite(nfs, fh, buf, len, offset); }
+
+template<class Bufptr>
+auto fix_nfs_pwrite(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len, off_t offset)
+-> decltype(nfs_pwrite(nfs, fh, offset, len, buf))
+   { return nfs_pwrite(nfs, fh, offset, len, buf); }
+
+template<class Nfs>
+auto fix_nfs_set_poll_timeout(Nfs* nfs, int/*millisec*/)
+-> decltype(nfs_read(nfs, nullptr, 1, (void*)nullptr), (void)0)
+   {} // older libnfs has no nfs_set_poll_timeout
+
+template<class Nfs>
+auto fix_nfs_set_poll_timeout(Nfs* nfs, int millisec)
+-> decltype(nfs_read(nfs, nullptr, (void*)nullptr, 1), (void)0)
+   { nfs_set_poll_timeout(nfs, millisec); }
+
+#define nfs_read   fix_nfs_read
+#define nfs_pread  fix_nfs_pread
+#define nfs_pwrite fix_nfs_pwrite
+#define nfs_set_poll_timeout fix_nfs_set_poll_timeout
+
 class TailingNFS : public FileSystem {
  public:
   TailingNFS(const json&, const SidePluginRepo&);
