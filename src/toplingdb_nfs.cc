@@ -4,17 +4,25 @@
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
+#if defined(_MSC_VER)
+#define _CRT_NONSTDC_NO_DEPRECATE
+#endif
 
 #include <terark/num_to_str.hpp>
 #include <nfsc/libnfs.h> // yum install libnfs-devel
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
-
 #include <rocksdb/file_system.h>
 #include <topling/side_plugin_factory.h>
 #include "logging/env_logger.h"
+
+#if defined(_MSC_VER)
+#include <io.h>
+#define S_ISDIR(mode) (mode & _S_IFMT) == _S_IFDIR
+#else
+#include <unistd.h>
+#endif
 
 const char* git_version_hash_info_toplingdb_fs();
 
@@ -539,8 +547,8 @@ IOStatus TailingNFS::NewWritableFile(
 IOStatus TailingNFS::ReopenWritableFile(
     const std::string& fname, const FileOptions& options,
     std::unique_ptr<FSWritableFile>* result, IODebugContext* dbg) {
-  struct stat st;
-  int err = nfs_stat(m_nfs, fname.c_str(), &st);
+  struct nfs_stat_64 st;
+  int err = nfs_stat64(m_nfs, fname.c_str(), &st);
   if (err) {
     return IOStatus::IOError("TailingNFS::ReopenWritableFile: nfs_stat",
                              fname + ": " + nfs_get_error(m_nfs));
@@ -549,7 +557,7 @@ IOStatus TailingNFS::ReopenWritableFile(
   // nfs append write needs getattr for file size, never use O_APPEND!
   // instead we get file size for init m_offset, thus avoid getattr on
   // each append write.
-  f->m_offset = st.st_size;
+  f->m_offset = st.nfs_size;
   int flags = O_WRONLY|O_CREAT; //|O_APPEND;
   err = nfs_open(m_nfs, fname.c_str(), flags, &f->m_fh);
   if (err) {
@@ -851,7 +859,11 @@ IOStatus TailingNFS::GetTestDirectory(const IOOptions& options,
                                       IODebugContext* dbg) {
   // copy from ChrootFileSystem::GetTestDirectory
   char buf[256];
+ #if defined(_MSC_VER)
+  snprintf(buf, sizeof(buf), "/rocksdbtest-%d", 1001);
+ #else
   snprintf(buf, sizeof(buf), "/rocksdbtest-%d", static_cast<int>(geteuid()));
+ #endif
   *path = buf;
   return CreateDirIfMissing(*path, options, dbg);
 }

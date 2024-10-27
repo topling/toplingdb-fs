@@ -1,24 +1,41 @@
 // Copyright (c) 2021-present, Topling, Inc.  All rights reserved.
-// Created by leipeng at 2024-10-14
+// Created by leipeng at 2024-10-09
 //  Copyright (c) Topling, Inc. and its affiliates. All Rights Reserved.
 //  This source code is licensed under both the GPLv2 (found in the
 //  COPYING file in the root directory) and Apache 2.0 License
 //  (found in the LICENSE.Apache file in the root directory).
+#if defined(_MSC_VER)
+#define _CRT_NONSTDC_NO_DEPRECATE
+#endif
 
 #include <terark/num_to_str.hpp>
 #include <nfsc/libnfs.h> // yum install libnfs-devel
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <unistd.h>
-
 #include <rocksdb/file_system.h>
 #include <topling/side_plugin_factory.h>
 #include "logging/env_logger.h"
 
+#if defined(_MSC_VER)
+#include <io.h>
+#define S_ISDIR(mode) (mode & _S_IFMT) == _S_IFDIR
+#else
+#include <unistd.h>
+#endif
+
 const char* git_version_hash_info_toplingdb_fs();
 
 namespace ROCKSDB_NAMESPACE {
+
+// use libnfs to speed up tailing read performance.
+// linux kernel nfs tailing needs to set mount option `noac`,
+// because linux kernel nfs needs to getattr before tailing.
+// if there is no option `noac`, tailing will wait until attribute
+// cache ttl(3 seconds by default).
+// even with `noac`, linux kernel nfs has an extra getattr before
+// tailing read, this is not needed. libnfs will not send getattr
+// before (tailing) read.
 
 // lignfs https://github.com/sahlberg/libnfs
 // libnfs changed param order of read/pread/pwrite at commit 5e8f7ce2,
@@ -54,9 +71,20 @@ auto fix_nfs_pwrite(nfs_context* nfs, nfsfh* fh, Bufptr buf, size_t len, off_t o
 -> decltype(nfs_pwrite(nfs, fh, offset, len, buf))
    { return nfs_pwrite(nfs, fh, offset, len, buf); }
 
+template<class Nfs>
+auto fix_nfs_set_poll_timeout(Nfs* nfs, int/*millisec*/)
+-> decltype(nfs_read(nfs, nullptr, 1, (void*)nullptr), (void)0)
+   {} // older libnfs has no nfs_set_poll_timeout
+
+template<class Nfs>
+auto fix_nfs_set_poll_timeout(Nfs* nfs, int millisec)
+-> decltype(nfs_read(nfs, nullptr, (void*)nullptr, 1), (void)0)
+   { nfs_set_poll_timeout(nfs, millisec); }
+
 #define nfs_read   fix_nfs_read
 #define nfs_pread  fix_nfs_pread
 #define nfs_pwrite fix_nfs_pwrite
+#define nfs_set_poll_timeout fix_nfs_set_poll_timeout
 
 class S3FS : public FileSystem {
  public:
@@ -164,6 +192,8 @@ class S3FS : public FileSystem {
   std::string osfs_mount_root; // required when use_osfs_write
   std::shared_ptr<FileSystem> osfs;
 
+  int nfs_rpc_timeout_ms = 60 * 100; // nfs default rpc timeout 60 seconds
+  int nfs_poll_timeout_ms = 100;
   std::string nfs_server; // nfs://server.host.name
   std::string nfs_export; // /path/to/export
 
@@ -185,6 +215,8 @@ S3FS::S3FS(const json& js, const SidePluginRepo& repo) {
   else if ((osfs != nullptr) ^ osfs_mount_root.empty()) {
     THROW_InvalidArgument("osfs and osfs_mount_root must be set both or neither");
   }
+  ROCKSDB_JSON_OPT_PROP(js, nfs_rpc_timeout_ms);
+  ROCKSDB_JSON_OPT_PROP(js, nfs_poll_timeout_ms);
   ROCKSDB_JSON_REQ_PROP(js, nfs_server);
   ROCKSDB_JSON_REQ_PROP(js, nfs_export);
   // just very basic validity check
@@ -195,6 +227,8 @@ S3FS::S3FS(const json& js, const SidePluginRepo& repo) {
     THROW_InvalidArgument("Bad param: nfs_export: " + nfs_export);
   }
   m_nfs = nfs_init_context();
+  nfs_set_timeout(m_nfs, nfs_rpc_timeout_ms);
+  nfs_set_poll_timeout(m_nfs, nfs_poll_timeout_ms);
   int err = nfs_mount(m_nfs, nfs_server.c_str(), nfs_export.c_str());
   if (err) {
     throw Status::IOError(
@@ -244,14 +278,13 @@ NFSGetUniqueId(nfs_context* nfs, nfsfh* fh, char* id, size_t max_size) {
   return static_cast<size_t>(rid - id);
 }
 
-struct TailingNFSReaderFile : FSRandomAccessFile, FSSequentialFile {
+struct S3FSReaderFile : FSRandomAccessFile, FSSequentialFile {
   nfs_context* m_nfs = nullptr;
   nfsfh* m_fh = nullptr;
-  size_t m_offset = 0;
   std::string m_fname;
-  bool m_is_random_access = true;
+  bool m_is_random_access; // intentional not init
 
-  ~TailingNFSReaderFile() override {
+  ~S3FSReaderFile() override {
     if (m_fh)
       nfs_close(m_nfs, m_fh);
   }
@@ -261,7 +294,7 @@ struct TailingNFSReaderFile : FSRandomAccessFile, FSSequentialFile {
                 IODebugContext* dbg) const override {
     int len = nfs_pread(m_nfs, m_fh, scratch, n, offset);
     if (len < 0) {
-      return IOStatus::IOError("TailingNFSReaderFile::Read nfs_pread",
+      return IOStatus::IOError("S3FSReaderFile::Read nfs_pread",
         m_fname + nfs_get_error(m_nfs));
     }
     result->data_ = scratch;
@@ -290,28 +323,26 @@ struct TailingNFSReaderFile : FSRandomAccessFile, FSSequentialFile {
   //-------------------------------------------------------------------------
   // FSSequentialFile methods:
 
-  IOStatus Read(size_t n, const IOOptions& options, Slice* result,
-                char* scratch, IODebugContext* dbg) {
+  IOStatus Read(size_t n, const IOOptions&, Slice* result,
+                char* scratch, IODebugContext*) {
+    // there is m_fh->offset internal, it is equal to m_offset
     int len = nfs_read(m_nfs, m_fh, scratch, n);
     if (len < 0) {
-      return IOStatus::IOError("TailingNFSReaderFile::Read nfs_read",
+      return IOStatus::IOError("S3FSReaderFile::Read nfs_read",
         m_fname + nfs_get_error(m_nfs));
     }
-    m_offset += len;
     result->data_ = scratch;
     result->size_ = len;
     return IOStatus::OK();
   }
 
   IOStatus Skip(uint64_t n) {
-    uint64_t cur_offset;
+    uint64_t cur_offset; // SEEK_CUR need not nfs rpc, just SEEK_END need
     int err = nfs_lseek(m_nfs, m_fh, n, SEEK_CUR, &cur_offset);
     if (err) {
-      return IOStatus::IOError("TailingNFSReaderFile::Skip nfs_lseek",
+      return IOStatus::IOError("S3FSReaderFile::Skip nfs_lseek",
         m_fname + nfs_get_error(m_nfs));
     }
-    m_offset += n;
-    ROCKSDB_VERIFY_EQ(cur_offset, m_offset);
     return IOStatus::OK();
   }
 
@@ -325,7 +356,7 @@ struct TailingNFSReaderFile : FSRandomAccessFile, FSSequentialFile {
                           IODebugContext* /*dbg*/) override {
     int len = nfs_pread(m_nfs, m_fh, scratch, n, offset);
     if (len < 0) {
-      return IOStatus::IOError("TailingNFSReaderFile::PositionedRead nfs_pread",
+      return IOStatus::IOError("S3FSReaderFile::PositionedRead nfs_pread",
         m_fname + nfs_get_error(m_nfs));
     }
     result->data_ = scratch;
@@ -339,7 +370,7 @@ struct TailingNFSReaderFile : FSRandomAccessFile, FSSequentialFile {
 IOStatus S3FS::NewSequentialFile(
     const std::string& fname, const FileOptions& options,
     std::unique_ptr<FSSequentialFile>* result, IODebugContext* dbg) {
-  auto f = new TailingNFSReaderFile;
+  auto f = new S3FSReaderFile;
   int err = nfs_open(m_nfs, fname.c_str(), O_RDONLY, &f->m_fh);
   if (err) {
     delete f;
@@ -355,7 +386,7 @@ IOStatus S3FS::NewSequentialFile(
 IOStatus S3FS::NewRandomAccessFile(
     const std::string& fname, const FileOptions& options,
     std::unique_ptr<FSRandomAccessFile>* result, IODebugContext* dbg) {
-  auto f = new TailingNFSReaderFile;
+  auto f = new S3FSReaderFile;
   int err = nfs_open(m_nfs, fname.c_str(), O_RDONLY, &f->m_fh);
   if (err) {
     delete f;
@@ -368,22 +399,21 @@ IOStatus S3FS::NewRandomAccessFile(
   return IOStatus::OK();
 }
 
-struct TailingNFSWritableFile : FSWritableFile {
+struct S3FSWritableFile : FSWritableFile {
   nfs_context* m_nfs = nullptr;
   nfsfh* m_fh = nullptr;
-  size_t m_fsize = 0;
   size_t m_offset = 0;
   std::string m_fname;
 
-  ~TailingNFSWritableFile() {
+  ~S3FSWritableFile() {
     if (m_fh)
       nfs_close(m_nfs, m_fh);
   }
-  IOStatus Append(const Slice& data, const IOOptions& options,
-                  IODebugContext* dbg) override {
+  IOStatus Append(const Slice& data, const IOOptions&,
+                  IODebugContext*) override {
     int len = nfs_pwrite(m_nfs, m_fh, data.data_, data.size_, m_offset);
     if (len < 0) {
-      return IOStatus::IOError("TailingNFSWritableFile::Append nfs_write",
+      return IOStatus::IOError("S3FSWritableFile::Append nfs_pwrite",
           m_fname + " : " + nfs_get_error(m_nfs));
     }
     m_offset += len;
@@ -394,19 +424,20 @@ struct TailingNFSWritableFile : FSWritableFile {
                   IODebugContext* dbg) override {
     int len = nfs_pwrite(m_nfs, m_fh, data.data_, data.size_, m_offset);
     if (len < 0) {
-      return IOStatus::IOError("TailingNFSWritableFile::Append nfs_write",
+      return IOStatus::IOError("S3FSWritableFile::Append nfs_pwrite",
           m_fname + " : " + nfs_get_error(m_nfs));
     }
     m_offset += len;
     return IOStatus::OK();
   }
+  // Now PositionedAppend is not used in rocksdb, it is just a legacy api
   IOStatus PositionedAppend(const Slice& data, uint64_t offset,
                             const IOOptions& options,
                             IODebugContext* dbg) override {
     int len = nfs_pwrite(m_nfs, m_fh, data.data_, data.size_, offset);
     if (len < 0) {
       return IOStatus::IOError(
-          "TailingNFSWritableFile::PositionedAppend nfs_pwrite",
+          "S3FSWritableFile::PositionedAppend nfs_pwrite",
           m_fname + " : " + nfs_get_error(m_nfs));
     }
     return IOStatus::OK();
@@ -418,7 +449,7 @@ struct TailingNFSWritableFile : FSWritableFile {
     int len = nfs_pwrite(m_nfs, m_fh, data.data_, data.size_, offset);
     if (len < 0) {
       return IOStatus::IOError(
-          "TailingNFSWritableFile::PositionedAppend nfs_pwrite",
+          "S3FSWritableFile::PositionedAppend nfs_pwrite",
           m_fname + " : " + nfs_get_error(m_nfs));
     }
     return IOStatus::OK();
@@ -428,7 +459,7 @@ struct TailingNFSWritableFile : FSWritableFile {
     int err = nfs_ftruncate(m_nfs, m_fh, size);
     if (err) {
       return IOStatus::IOError(
-          "TailingNFSWritableFile::Truncate nfs_ftruncate",
+          "S3FSWritableFile::Truncate nfs_ftruncate",
           m_fname + " : " + nfs_get_error(m_nfs));
     }
     return IOStatus::OK();
@@ -436,7 +467,7 @@ struct TailingNFSWritableFile : FSWritableFile {
   IOStatus Close(const IOOptions& options, IODebugContext* dbg) override {
     int err = nfs_close(m_nfs, m_fh);
     if (err) {
-      return IOStatus::IOError("TailingNFSWritableFile::Close nfs_close",
+      return IOStatus::IOError("S3FSWritableFile::Close nfs_close",
           m_fname + " : " + nfs_get_error(m_nfs));
     }
     return IOStatus::OK();
@@ -462,7 +493,7 @@ struct TailingNFSWritableFile : FSWritableFile {
     return Env::WriteLifeTimeHint::WLTH_NONE;
   }
   uint64_t GetFileSize(const IOOptions& options, IODebugContext* dbg) override {
-    return m_fsize;
+    return m_offset;
   }
   void SetPreallocationBlockSize(size_t size) override {}
   void GetPreallocationStatus(size_t* block_size,
@@ -491,13 +522,16 @@ struct TailingNFSWritableFile : FSWritableFile {
   }
 
   intptr_t FileDescriptor() const final { return -1; }
-  void SetFileSize(uint64_t fsize) final { m_fsize = fsize; }
+
+  // The semantic is seek to fsize for later writes
+  void SetFileSize(uint64_t fsize) final { m_offset = fsize; }
 };
 
 IOStatus S3FS::NewWritableFile(
     const std::string& fname, const FileOptions& options,
     std::unique_ptr<FSWritableFile>* result, IODebugContext* dbg) {
-  auto f = new TailingNFSWritableFile;
+  auto f = new S3FSWritableFile;
+  // nfs append write needs getattr for file size, never use O_APPEND
   int flags = O_WRONLY|O_CREAT|O_TRUNC;
   int err = nfs_open(m_nfs, fname.c_str(), flags, &f->m_fh);
   if (err) {
@@ -513,9 +547,19 @@ IOStatus S3FS::NewWritableFile(
 IOStatus S3FS::ReopenWritableFile(
     const std::string& fname, const FileOptions& options,
     std::unique_ptr<FSWritableFile>* result, IODebugContext* dbg) {
-  auto f = new TailingNFSWritableFile;
-  int flags = O_WRONLY|O_CREAT|O_APPEND;
-  int err = nfs_open(m_nfs, fname.c_str(), flags, &f->m_fh);
+  struct nfs_stat_64 st;
+  int err = nfs_stat64(m_nfs, fname.c_str(), &st);
+  if (err) {
+    return IOStatus::IOError("S3FS::ReopenWritableFile: nfs_stat",
+                             fname + ": " + nfs_get_error(m_nfs));
+  }
+  auto f = new S3FSWritableFile;
+  // nfs append write needs getattr for file size, never use O_APPEND!
+  // instead we get file size for init m_offset, thus avoid getattr on
+  // each append write.
+  f->m_offset = st.nfs_size;
+  int flags = O_WRONLY|O_CREAT; //|O_APPEND;
+  err = nfs_open(m_nfs, fname.c_str(), flags, &f->m_fh);
   if (err) {
     delete f;
     return IOStatus::IOError("S3FS::ReopenWritableFile: nfs_open",
@@ -540,7 +584,7 @@ IOStatus S3FS::NewRandomRWFile(
 "Not supported: IngestExternalFileOptions::allow_global_seqno must be false");
 }
 
-struct TailingNFSDirectory : public FSDirectory {
+struct S3FSDirectory : public FSDirectory {
   IOStatus Fsync(const IOOptions&, IODebugContext*) override {
     return IOStatus::OK();
   }
@@ -564,7 +608,7 @@ IOStatus S3FS::NewDirectory(const std::string& dir,
     return IOStatus::IOError("S3FS::NewDirectory: nfs_mkdir",
         dir + " : " + nfs_get_error(m_nfs));
   }
-  result->reset(new TailingNFSDirectory);
+  result->reset(new S3FSDirectory);
   return IOStatus::OK();
 }
 
@@ -727,8 +771,8 @@ IOStatus S3FS::LinkFile(const std::string& src,
   return IOStatus::OK();
 }
 
-struct TailingNFSLock : public FileLock {
-  ~TailingNFSLock() {
+struct S3FSLock : public FileLock {
+  ~S3FSLock() {
     if (locked) {
       nfs_lockf(nfs, fh, NFS4_F_ULOCK, 0);
     }
@@ -744,7 +788,7 @@ IOStatus S3FS::LockFile(const std::string& fname,
                               const IOOptions& options, FileLock** lock,
                               IODebugContext* dbg) {
   *lock = nullptr;
-  auto lk = new TailingNFSLock;
+  auto lk = new S3FSLock;
   int err = nfs_open2(m_nfs, fname.c_str(), O_CREAT|O_WRONLY, 0644, &lk->fh);
   if (err) {
     delete lk;
@@ -766,7 +810,7 @@ IOStatus S3FS::LockFile(const std::string& fname,
 IOStatus S3FS::UnlockFile(FileLock* flock,
                                 const IOOptions& options,
                                 IODebugContext* dbg) {
-  auto lk = dynamic_cast<TailingNFSLock*>(flock);
+  auto lk = dynamic_cast<S3FSLock*>(flock);
   int err = nfs_lockf(m_nfs, lk->fh, NFS4_F_ULOCK, 0);
   lk->locked = false; // always treat as unlocked
   auto fname = std::move(lk->fname);
@@ -815,7 +859,11 @@ IOStatus S3FS::GetTestDirectory(const IOOptions& options,
                                       IODebugContext* dbg) {
   // copy from ChrootFileSystem::GetTestDirectory
   char buf[256];
+ #if defined(_MSC_VER)
+  snprintf(buf, sizeof(buf), "/rocksdbtest-%d", 1001);
+ #else
   snprintf(buf, sizeof(buf), "/rocksdbtest-%d", static_cast<int>(geteuid()));
+ #endif
   *path = buf;
   return CreateDirIfMissing(*path, options, dbg);
 }
